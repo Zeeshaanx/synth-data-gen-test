@@ -1,0 +1,86 @@
+name: Deploy EC2 + Run Ansible
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+      github_token: ${{ secrets.WLD_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up SSH key for EC2 access
+        run: |
+          printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > key-path
+          chmod 600 key-path
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Delete previous EC2 instance(s) with Name=NemoDataDesigner
+        run: |
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=NemoDataDesigner" "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCES" ]; then
+            echo "Terminating existing instances: $INSTANCES"
+            aws ec2 terminate-instances --instance-ids $INSTANCES
+            echo "Waiting for instances to terminate..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCES
+          else
+            echo "No existing NemoDataDesigner instances found."
+          fi
+
+      - name: Terraform Init
+        working-directory: src/terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: src/terraform
+        run: terraform apply -auto-approve
+
+      - name: Wait for EC2 SSH to be ready
+        run: |
+          IP=$(awk 'NR==2 {print $1}' src/ansible/inventory)
+          echo "Waiting for SSH at $IP..."
+          for i in {1..30}; do
+            ssh -o StrictHostKeyChecking=no -i key-path ubuntu@$IP "echo Connected" && break || sleep 10
+          done
+
+      - name: Show generated inventory
+        run: |
+          cat src/ansible/inventory
+
+      - name: Extract IP from inventory file
+        id: get_ip
+        run: |
+          IP=$(awk 'NR==2 {print $1}' src/ansible/inventory)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Run Ansible Playbook
+        run: |
+          export ANSIBLE_SSH_ARGS="-o ServerAliveInterval=60 -o ServerAliveCountMax=30"
+          ansible-playbook -i src/ansible/inventory src/ansible/deploy.yml \
+            --extra-vars "github_token=${{ secrets.WLD_TOKEN }} pg_password=${{ secrets.PG_PASSWORD }}" \
+            -vvv
